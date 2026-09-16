@@ -2,6 +2,8 @@
 
 在 tmux 多窗口环境下增强 Claude Code 的会话状态可视化。通过 Claude Code 的 hooks 机制，在 tmux 窗口标签上实时反映每个会话的状态：等待授权、正在工作、已完成。
 
+仓库里还附带一个独立工具 `wtmux`：把一个仓库的每个 git worktree 各开一个 tmux 窗口，窗口名带上分支和该 worktree 正在监听的端口——多窗口跑 agent 时用它一键铺开。
+
 ## 解决什么问题
 
 同时在多个 tmux 窗口中运行 Claude Code 时，很难判断哪个窗口需要你操作、哪个已经完成。这套 hooks 用颜色和文字标记解决这个问题：
@@ -21,6 +23,7 @@
 | `tmux-restore-name.sh` | Claude Code `UserPromptSubmit` | 用户发送消息时恢复窗口名称 |
 | `tmux-focus-strip-done.sh` | tmux `session-window-changed` | 切到窗口时自动移除 DONE |
 | `agent-tmux-wrapper.sh` | 手动运行 | 让非 Claude Code 的 agent 也能使用状态提示 |
+| `wtmux` | 手动运行 | 每个 git worktree 开一个 tmux 窗口，窗口名带分支和监听端口 |
 
 ## 安装
 
@@ -28,7 +31,10 @@
 
 ```bash
 git clone <repo-url> ~/hooks
-chmod +x ~/hooks/*.sh
+chmod +x ~/hooks/*.sh ~/hooks/wtmux
+
+# wtmux 是独立命令，建议放进 PATH
+ln -s ~/hooks/wtmux ~/bin/wtmux
 ```
 
 ### 2. 配置 Claude Code hooks
@@ -96,8 +102,36 @@ tmux source-file ~/.tmux.conf
 ~/hooks/agent-tmux-wrapper.sh qoder --model gpt-4o
 ```
 
+## 多 worktree 一键铺开：wtmux
+
+`wtmux` 把一个仓库的每个 git worktree 各开一个 tmux 窗口，窗口名形如 `<目录>:<分支> [<端口>]`。端口取的是「cwd 落在该 worktree 内的进程正在监听的 TCP 端口」，所以一眼能看出哪个 worktree 起了 dev server、跑在哪个端口上。
+
+```bash
+wtmux                          # 用当前目录所在的仓库
+wtmux ~/source/my-app          # 指定仓库（传子目录也行）
+wtmux -c qodercli              # 每个窗口都跑这条命令，命令退出后 shell 留着
+wtmux -- qoder --model gpt-4o  # 同上，-- 之后的内容整体作为命令
+wtmux -r                       # 只刷新窗口名（重新探测端口），不 attach
+wtmux -s my-app-dev            # 指定 / 覆盖 session 名（默认取仓库目录名）
+wtmux -k                       # 先杀掉同名 session，干净重来
+```
+
+几个行为细节：
+
+- **幂等**：已经有窗口的 worktree 会被跳过，新增 worktree 后重跑一次就能补上。
+- **端口需要手动刷新**：起停 dev server 之后跑一次 `wtmux -r`，窗口名上的端口才会更新。在 tmux 里跑可以省略 `-s`（自动用当前 session）。
+- **bare 仓库跳过**：没有工作区可开。
+- **attach 语义**：不在 tmux 里就 `attach-session`，已经在 tmux 里则 `switch-client` 切过去。
+
+和 wrapper 配合，每个 worktree 同时拉起 agent 和状态提示：
+
+```bash
+wtmux -c '~/hooks/agent-tmux-wrapper.sh qoder'
+```
+
 ## 依赖
 
 - tmux
 - jq
 - Claude Code（或其他通过 wrapper 使用的 CLI agent）
+- `wtmux` 另需 git；端口探测依赖 lsof，没装也能用，只是窗口名不带端口

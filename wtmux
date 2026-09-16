@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# wtmux — open every git worktree of a repo, each in its own tmux window.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+wtmux — open every git worktree of a repo, each in its own tmux window.
+
+Usage:
+  wtmux                 use the repo of the current directory
+  wtmux /path/to/repo   use a specific repo (any subdir works)
+  wtmux -c CMD          run CMD in each window (e.g. -c qodercli); shell stays after CMD exits
+  wtmux -- CMD [args]   same as -c; everything after -- is the command
+  wtmux -r              refresh window names only (re-detect listening ports), no attach
+  wtmux -s NAME         override / target the tmux session name (default: repo dir name)
+  wtmux -k              kill an existing session first (fresh start)
+  wtmux -h              this help
+
+Window names look like  <folder>:<branch> [<port>]  where <port> is any TCP port
+listened on by a process whose cwd is that worktree (or a subdir of it). After you
+start/stop a dev server, run `wtmux -r` to refresh the ports shown.
+Re-running is idempotent: a worktree that already has a window is skipped.
+EOF
+}
+
+repo="."
+session=""
+fresh=0
+refresh=0
+CMD=""
+SEP=":"          # window name = <folder><SEP><branch>
+PORTFMT='[%s]'   # appended (with a leading space) when a port is found; set "" to disable
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -s|--session) [ $# -ge 2 ] || { echo "wtmux: $1 needs a name" >&2; exit 2; }
+                  session="$2"; shift 2 ;;
+    -c|--cmd)     [ $# -ge 2 ] || { echo "wtmux: $1 needs a command" >&2; exit 2; }
+                  CMD="$2"; shift 2 ;;
+    -r|--refresh) refresh=1; shift ;;
+    -k|--fresh)   fresh=1; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    --)           shift; CMD="$*"; break ;;    # everything after -- is the command
+    -*)           echo "wtmux: unknown option: $1" >&2; exit 2 ;;
+    *)            repo="$1"; shift ;;
+  esac
+done
+
+# ---- listening-port scan (the two lsof passes) ------------------------------
+LISTEN_TAB=""   # pid<TAB>port  for every TCP LISTEN socket
+CWD_TAB=""      # pid<TAB>cwd   for those pids
+scan_ports() {
+  command -v lsof >/dev/null 2>&1 || return 0
+  LISTEN_TAB="$(lsof -nP -iTCP -sTCP:LISTEN -F pcnd 2>/dev/null \
+    | awk '/^p/{pid=substr($0,2)} /^n/{a=substr($0,2); k=split(a,x,":"); if(k>=2 && x[k]!="") print pid "\t" x[k]}' || true)"
+  [ -n "$LISTEN_TAB" ] || return 0
+  local pids
+  pids="$(printf '%s\n' "$LISTEN_TAB" | cut -f1 | sort -u | paste -sd, -)"
+  [ -n "$pids" ] || return 0
+  CWD_TAB="$(lsof -a -p "$pids" -d cwd -Fn 2>/dev/null \
+    | awk '/^p/{pid=substr($0,2)} /^n/{print pid "\t" substr($0,2)}' || true)"
+}
+
+# Echo the comma-joined unique ports listened on by processes whose cwd is $1 or a subdir of it.
+ports_for() {
+  awk -F'\t' -v W="$1" '
+    NR==FNR { cwd[$1]=$2; next }
+    { c=cwd[$1]; if (c==W || index(c, W "/")==1) print $2 }
+  ' <(printf '%s\n' "$CWD_TAB") <(printf '%s\n' "$LISTEN_TAB") 2>/dev/null \
+    | sort -un | paste -sd, -
+}
+
+# " [3000]" when a port is present and PORTFMT is set, else "".
+port_suffix() {
+  if [ -n "$PORTFMT" ] && [ -n "${1:-}" ]; then printf ' %s' "$(printf "$PORTFMT" "$1")"; fi
+  return 0
+}
+
+# Stamp a freshly created window with its worktree path + base label; run $CMD if given.
+finish_window() {  # $1=window_id  $2=worktree_path  $3=base_label
+  tmux set-option -w -t "$1" @wtmux_path "$2"
+  tmux set-option -w -t "$1" @wtmux_base "$3"
+  if [ -n "$CMD" ]; then
+    tmux send-keys -t "$1" -l -- "$CMD"
+    tmux send-keys -t "$1" Enter
+  fi
+}
+
+# Rename every window in $session to <base>[<port>] from the current scan. Echoes #changed.
+refresh_names() {
+  local wid wp base newname cur changed=0
+  while IFS= read -r wid; do
+    [ -n "$wid" ] || continue
+    wp="$(tmux display-message -p -t "$wid" '#{@wtmux_path}' 2>/dev/null || true)"
+    base="$(tmux display-message -p -t "$wid" '#{@wtmux_base}' 2>/dev/null || true)"
+    [ -n "$wp" ] && [ -n "$base" ] || continue
+    newname="${base}$(port_suffix "$(ports_for "$wp")")"
+    cur="$(tmux display-message -p -t "$wid" '#{window_name}')"
+    [ "$cur" = "$newname" ] || { tmux rename-window -t "$wid" "$newname"; changed=$((changed + 1)); }
+  done < <(tmux list-windows -t "=$session" -F '#{window_id}')
+  printf '%s' "$changed"
+}
+
+# ---- refresh-only mode ------------------------------------------------------
+if [ "$refresh" -eq 1 ]; then
+  if [ -z "$session" ]; then
+    if [ -n "${TMUX:-}" ]; then session="$(tmux display-message -p '#S')"
+    else echo "wtmux: -r needs -s NAME (or run it inside tmux)" >&2; exit 2; fi
+  fi
+  tmux has-session -t "=$session" 2>/dev/null || { echo "wtmux: no session '$session'" >&2; exit 1; }
+  scan_ports
+  n="$(refresh_names)"
+  echo "wtmux: refreshed '$session' ($n window(s) renamed)" >&2
+  exit 0
+fi
+
+# ---- normal mode ------------------------------------------------------------
+if ! git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "wtmux: '$repo' is not inside a git repository" >&2
+  exit 1
+fi
+
+# Parse `git worktree list --porcelain` into parallel arrays.
+paths=(); names=()
+cur_path=""; cur_name=""; cur_bare=0
+flush() {
+  [ -n "$cur_path" ] || return 0
+  if [ "$cur_bare" -eq 0 ]; then                 # skip bare repos (nothing to open)
+    dir="$(basename "$cur_path")"                # folder name of this worktree
+    if [ -n "$cur_name" ]; then
+      label="${dir}${SEP}${cur_name}"            # folder + branch  (e.g. wt-one:feat/one)
+    else
+      label="$dir"                               # no branch info: folder only
+    fi
+    paths+=("$cur_path"); names+=("$label")
+  fi
+  cur_path=""; cur_name=""; cur_bare=0
+}
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    "worktree "*) flush; cur_path="${line#worktree }" ;;
+    "branch "*)   cur_name="${line#branch refs/heads/}" ;;
+    "detached")   cur_name="(detached)" ;;
+    "bare")       cur_bare=1 ;;
+  esac
+done < <(git -C "$repo" worktree list --porcelain)
+flush
+
+if [ "${#paths[@]}" -eq 0 ]; then
+  echo "wtmux: no worktrees found" >&2
+  exit 1
+fi
+
+[ -n "$session" ] || session="$(basename "${paths[0]}")"
+
+if [ "$fresh" -eq 1 ] && tmux has-session -t "=$session" 2>/dev/null; then
+  tmux kill-session -t "=$session"
+fi
+
+# Create the session (detached) with the first worktree, or reuse an existing one.
+created=0
+if ! tmux has-session -t "=$session" 2>/dev/null; then
+  wid="$(tmux new-session -d -P -F '#{window_id}' -s "$session" -n "${names[0]}" -c "${paths[0]}")"
+  finish_window "$wid" "${paths[0]}" "${names[0]}"
+  created=1
+fi
+
+# Add a window per worktree that doesn't already have one (matched by stored path).
+existing="$(tmux list-windows -t "=$session" -F '#{@wtmux_path}' 2>/dev/null || true)"
+i=0
+while [ "$i" -lt "${#paths[@]}" ]; do
+  p="${paths[$i]}"; n="${names[$i]}"
+  if [ "$i" -eq 0 ] && [ "$created" -eq 1 ]; then
+    :                                            # already the session's first window
+  elif ! grep -Fxq -- "$p" <<<"$existing"; then
+    wid="$(tmux new-window -P -F '#{window_id}' -t "=$session" -n "$n" -c "$p")"
+    finish_window "$wid" "$p" "$n"
+  fi
+  i=$((i + 1))
+done
+
+# Detect listening ports and fold them into every window's name.
+scan_ports
+changed="$(refresh_names)"
+
+# Land on the lowest-numbered window (respects base-index).
+first_idx="$(tmux list-windows -t "=$session" -F '#{window_index}' | sort -n | head -1)"
+tmux select-window -t "=$session:$first_idx"
+
+msg="wtmux: session '$session' — ${#paths[@]} worktree(s)"
+[ -n "$CMD" ] && msg="$msg, each running: $CMD"
+[ "$changed" -gt 0 ] && msg="$msg, $changed named with a port"
+echo "$msg" >&2
+
+# Attach, or switch if we're already inside tmux.
+if [ -n "${TMUX:-}" ]; then
+  tmux switch-client -t "=$session"
+else
+  tmux attach-session -t "=$session"
+fi
