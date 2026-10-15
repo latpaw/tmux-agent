@@ -20,6 +20,7 @@ Window names look like  <folder>:<branch> [<port>]  where <port> is any TCP port
 listened on by a process whose cwd is that worktree (or a subdir of it). After you
 start/stop a dev server, run `wtmux -r` to refresh the ports shown.
 Re-running is idempotent: a worktree that already has a window is skipped.
+The first side-by-side split in each window is automatically sized 70% / 30%.
 EOF
 }
 
@@ -84,6 +85,21 @@ finish_window() {  # $1=window_id  $2=worktree_path  $3=base_label
     tmux send-keys -t "$1" -l -- "$CMD"
     tmux send-keys -t "$1" Enter
   fi
+}
+
+# Set a session-local default for the first side-by-side split; keep other hooks.
+configure_splits() {
+  local target="=$session:" hook
+  # A local hook array shadows the global one, so retain inherited hooks first.
+  if [ -z "$(tmux show-hooks -t "$target" after-split-window)" ]; then
+    while IFS= read -r hook; do
+      [ -n "$hook" ] || continue
+      tmux set-hook -a -t "$target" after-split-window "$hook"
+    done < <(tmux show-options -gqv after-split-window)
+  fi
+  # A fixed index makes re-running wtmux idempotent. Full-width panes are stacked.
+  tmux set-hook -t "$target" 'after-split-window[7030]' \
+    'if-shell -F "#{&&:#{==:#{window_panes},2},#{!=:#{pane_width},#{window_width}}}" { resize-pane -t "{left}" -x 70% }'
 }
 
 # Rename every window in $session to <base>[<port>] from the current scan. Echoes #changed.
@@ -164,6 +180,8 @@ if ! tmux has-session -t "=$session" 2>/dev/null; then
   finish_window "$wid" "${paths[0]}" "${names[0]}"
   created=1
 fi
+
+configure_splits
 
 # Add a window per worktree that doesn't already have one (matched by stored path).
 existing="$(tmux list-windows -t "=$session" -F '#{@wtmux_path}' 2>/dev/null || true)"
